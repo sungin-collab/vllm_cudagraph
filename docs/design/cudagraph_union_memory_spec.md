@@ -1,6 +1,7 @@
 # CUDA graph union memory: software specification
 
-Status: proposed specification; implementation and GPU validation pending.
+Status: CPU prerequisites implemented; production integration and GPU validation
+pending. See the [implementation status](cudagraph_union_memory_implementation.md).
 
 Date: 2026-10-16.
 
@@ -13,8 +14,8 @@ This document specifies the measurement tools, memory planner, and opt-in runtim
 integration needed to evaluate and implement the plan. **MUST** identifies a
 correctness or acceptance requirement; **SHOULD** identifies a preferred design
 that needs a documented reason to change. Proposed configuration fields,
-interfaces, and new file paths below do not exist yet. Performance figures are
-targets, not results.
+interfaces, and file paths describe the target implementation; the status document
+identifies the implemented subset. Performance figures are targets, not results.
 
 ## 1. Objective and scope
 

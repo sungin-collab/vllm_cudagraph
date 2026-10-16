@@ -1,0 +1,146 @@
+{
+  "identity": {
+    "model_revision": "synthetic",
+    "config_digest": "config",
+    "tensor_layout_digest": "t",
+    "kv_layout_digest": "kv",
+    "backend": "fake",
+    "allocator": "fake",
+    "dtype": "uint8",
+    "compilation_digest": "program",
+    "software_digest": "versions",
+    "device_capabilities": "cpu simulator",
+    "storage_backend_version": "fake v1",
+    "device": "cpu:0",
+    "execution_lane": "single ordered lane",
+    "exclusive_members": true
+  },
+  "members": [
+    {
+      "descriptor": {
+        "runner": "v1",
+        "fields": [
+          [
+            "has_lora",
+            false
+          ],
+          [
+            "num_active_loras",
+            0
+          ],
+          [
+            "num_reqs",
+            1
+          ],
+          [
+            "num_tokens",
+            1
+          ],
+          [
+            "runtime_mode",
+            "FULL"
+          ],
+          [
+            "uniform",
+            true
+          ]
+        ],
+        "schema_version": 1
+      },
+      "operations": [
+        "0w",
+        "0r",
+        "1w",
+        "1r"
+      ],
+      "dependencies": [
+        {
+          "source": "0w",
+          "target": "0r",
+          "evidence": "stream_order"
+        },
+        {
+          "source": "1w",
+          "target": "1r",
+          "evidence": "stream_order"
+        },
+        {
+          "source": "0r",
+          "target": "1w",
+          "evidence": "event_wait"
+        }
+      ],
+      "allocations": [
+        {
+          "allocation_id": "0",
+          "site_id": "site0",
+          "occurrence": 0,
+          "requested_bytes": 64,
+          "reserved_bytes": 64,
+          "alignment": 16,
+          "owner": "backend",
+          "storage_class": "scratch",
+          "binding_id": "binding0"
+        },
+        {
+          "allocation_id": "1",
+          "site_id": "site1",
+          "occurrence": 0,
+          "requested_bytes": 64,
+          "reserved_bytes": 64,
+          "alignment": 16,
+          "owner": "backend",
+          "storage_class": "scratch",
+          "binding_id": "binding1"
+        }
+      ],
+      "aliases": [],
+      "accesses": [
+        {
+          "allocation_id": "0",
+          "operation": "0w",
+          "offset": 0,
+          "size": 64,
+          "kind": "write"
+        },
+        {
+          "allocation_id": "0",
+          "operation": "0r",
+          "offset": 0,
+          "size": 64,
+          "kind": "read"
+        },
+        {
+          "allocation_id": "1",
+          "operation": "1w",
+          "offset": 0,
+          "size": 64,
+          "kind": "write"
+        },
+        {
+          "allocation_id": "1",
+          "operation": "1r",
+          "offset": 0,
+          "size": 64,
+          "kind": "read"
+        }
+      ],
+      "escapes": [],
+      "coverage": {
+        "declared_sites": [
+          "site0",
+          "site1"
+        ],
+        "observed_sites": [
+          "site0",
+          "site1"
+        ],
+        "access_contract": "explicit accesses v1",
+        "alias_contract": "no aliases v1",
+        "discovery_method": "synthetic",
+        "gaps": []
+      }
+    }
+  ],
+  "schema_version": 1
+}
