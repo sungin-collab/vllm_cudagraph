@@ -1,10 +1,11 @@
 # CUDA graph union-memory tools
 
-These tools implement the CPU prerequisites of the
+These tools implement the planner, diagnostic collection, reporting and explicit
+CUDA binding probe for the
 [union-memory specification](../../docs/design/cudagraph_union_memory_spec.md).
-They do not change production capture, allocate CUDA storage, or demonstrate GPU
-memory savings. Production collection and binding remain gated on the Stage 1/2
-measurements described in the specification.
+They leave serving defaults unchanged. The probe allocates CUDA storage but does
+not demonstrate savings against the production shared pool. Production union
+binding remains gated on positive Stage 1/2 evidence.
 
 ## Simulate a layout
 
@@ -45,9 +46,9 @@ slack likewise must not be added to each other.
 
 ## Report saved measurements
 
-`schema.py` defines a strict `RunRecord` reporting input. A future production
-collector must emit the detailed manifests and raw events from Section 9 of the
-specification alongside these records. `controls_digest` covers model/weights,
+`schema.py` defines a strict `RunRecord` reporting input. The diagnostic collector
+emits manifests, raw events and allocator snapshots alongside these records;
+physical allocation/access attribution remains pending. `controls_digest` covers model/weights,
 KV/layout limits, compilation/backend/allocator settings, warmup, output retention,
 GC/trimming policy, instrumentation, completed-step boundary, and workload policy.
 Run identity and treatment are excluded from that digest. `manifest_digest`
@@ -81,20 +82,89 @@ Measurement uncertainty is reported separately from sampling intervals, so these
 intervals alone must not be used for acceptance. GPU, enqueue and completed-step
 times are never added together. Correctness and acceptance remain explicit.
 
-The collector must enforce fresh processes, alternate treatment order, control
-GPU contention, capture all descriptors using the production manager, preserve
-state, and measure startup/teardown. Those collection operations, standalone
-references, excess-workspace statistics, plots and acceptance gates are pending.
+The diagnostic collector runs fresh processes, checks GPU contention, observes the
+production manager and records startup/teardown. It resolves the shared baseline
+first, then reverses the diagnostic control order on alternating repetitions.
+This is not the alternating baseline/union timing experiment required for final
+acceptance. Allocation liveness attribution, timing passes, plots and production
+acceptance gates remain pending.
 
-## CPU tests
+## Collect production diagnostic controls
+
+Provide a JSON object of `LLM` options, using cached real weights. For example:
+
+```json
+{
+  "model": "/path/to/cached/llama-3.1-8b",
+  "dtype": "bfloat16",
+  "max_model_len": 128,
+  "max_num_batched_tokens": 128,
+  "max_num_seqs": 8,
+  "attention_config": {"backend": "TRITON_ATTN"},
+  "compilation_config": {"mode": 0}
+}
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=0 VLLM_USE_FLASHINFER_SAMPLER=0 \
+  .venv/bin/python -m benchmarks.cudagraphs.collect \
+  --engine-config /path/to/engine.json --capture-sizes 1,2,4,8 \
+  --kv-cache-memory-bytes 268435456 --repetitions 5 \
+  --stress-steps 10000 --output-dir /path/to/new-results
+
+.venv/bin/python -m benchmarks.cudagraphs.report --diagnostics \
+  /path/to/new-results/*/record.json --output /tmp/diagnostic-summary.json
+```
+
+The output directory must be new. Defaults include shared baseline, maximum-token,
+every standalone descriptor and separate-pool controls. For a smoke run use
+`--variants shared_baseline --repetitions 1 --stress-steps 100`. The collector
+requires an idle CUDA device, NVML and a dense text decoder on the V1 runner;
+distributed execution, MoE, multimodal, hybrid, LoRA and speculative decoding are
+unsupported. Explicit KV bytes avoid the startup graph-memory estimator. KV bytes
+and blocks in records come from the runner's allocated cache configuration;
+independent physical-storage verification remains pending.
+
+Every run retains status/reason, software/source/environment identity, resolved
+and captured descriptors, graph handles/pools, sampled device counters and full
+allocator snapshots. Sampling peaks are lower bounds. An unsupported or failed
+run exits nonzero and retains its artifacts. Memory attribution remains unknown
+until ownership and access evidence is available. Diagnostic dummy steps exercise
+dispatch/capture, not model accuracy or normal serving output consumers.
+
+## Run the explicit CUDA binding probe
+
+```bash
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m benchmarks.cudagraphs.binding_probe \
+  --switches 10000 --output /tmp/binding-probe.json
+
+CUDA_VISIBLE_DEVICES=0 compute-sanitizer --tool memcheck --error-exitcode 99 \
+  --log-file /tmp/binding-memcheck.log \
+  .venv/bin/python -m benchmarks.cudagraphs.binding_probe \
+  --switches 100 --output /tmp/binding-memcheck.json
+```
+
+The probe binds declared fill/copy kernels to planned addresses, includes a
+nonmonotonic member capacity and contiguous alias, keeps outputs external, poisons
+scratch and checks exact values. It validates storage generations and drains before
+retirement. It cannot redirect ordinary production allocations or establish their
+access contracts. Output explicitly records `production_capture: false` and no
+savings claim.
+
+## Tests
 
 ```bash
 .venv/bin/python -m pytest --noconftest \
-  tests/v1/cudagraph/test_cudagraph_memory_planner.py -q
+  tests/v1/cudagraph/test_cudagraph_memory_planner.py \
+  tests/v1/cudagraph/test_cudagraph_memory_binding.py \
+  tests/benchmarks/test_cudagraph_memory_report.py \
+  tests/benchmarks/test_cudagraph_memory_collect.py -q
 ```
 
 `--noconftest` avoids the repository-wide model fixtures, which import PyTorch.
-The test module uses no fixtures from them. `cpu.py` loads the unchanged source
+These test modules use no fixtures from them. The collector adapter test imports
+vLLM and the binding test imports PyTorch; only the planner/report modules are
+dependency-light. `cpu.py` loads the unchanged source
 modules under a private package to avoid `vllm.__init__` initializing PyTorch;
 it does not mock their behavior or affect normal production imports. The same
 suite is wired into the existing CPU V1 CI job with its normal environment.
