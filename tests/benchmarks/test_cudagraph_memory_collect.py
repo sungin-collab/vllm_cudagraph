@@ -21,6 +21,111 @@ from benchmarks.cudagraphs.collect import (
     select_descriptors,
     validate_engine_options,
 )
+from benchmarks.cudagraphs.production import kv_storage_inventory
+
+
+@pytest.fixture
+def kv_storage():
+    """Real CPU views catch duplicate backing counts without CUDA or model loading."""
+    import torch
+
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+        create_kv_cache_views,
+    )
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    spec = FullAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.float32,
+        page_size_padded=40,
+    )
+    blocks = 3
+    layer_bytes = blocks * spec.page_size_bytes
+    size = 2 * layer_bytes
+    names = ["model.layers.0.attn", "model.layers.1.attn"]
+    placements = [
+        KVCacheTensor(size, [name], layer_bytes, spec.page_size_bytes, i * layer_bytes)
+        for i, name in enumerate(names)
+    ]
+    config = KVCacheConfig(
+        blocks,
+        placements,
+        [KVCacheGroupSpec(names, spec)],
+        kv_cache_layout="LBHNC",
+    )
+    backing = torch.empty(size, dtype=torch.uint8)
+    caches = [
+        create_kv_cache_views(backing, spec, blocks, KVCacheLayout.LBHNC, p)[0]
+        for p in placements
+    ]
+    return config, caches
+
+
+def test_kv_bytes_count_shared_backing_once_and_preserve_view_layout(kv_storage):
+    """Config + live views -> bytes/layout; aliases must not inflate KV controls."""
+    config, caches = kv_storage
+    # Padded pages create strided views at different offsets in the same backing.
+    assert not caches[1].is_contiguous()
+    assert caches[0].data_ptr() != caches[1].data_ptr()
+    result = kv_storage_inventory(config, caches, "cpu")
+    assert result["bytes"] == config.kv_cache_tensors[0].size
+    assert result["configured_backing_bytes"] == result["bytes"]
+    assert sum(p.size for p in config.kv_cache_tensors) == 2 * result["bytes"]
+    assert len(result["storages"]) == 1
+    assert [v["storage_id"] for v in result["views"]] == [0, 0]
+    view = result["views"][1]
+    assert view["offset_bytes"] == caches[1].storage_offset() * caches[1].element_size()
+    assert view["stride_bytes"] == [
+        s * caches[1].element_size() for s in caches[1].stride()
+    ]
+    assert result["group_details"] == [
+        dict(
+            group_id=0,
+            layers=config.kv_cache_groups[0].layer_names,
+            num_blocks=config.num_blocks,
+            block_size_tokens=2,
+            page_size_bytes=config.kv_cache_groups[0].kv_cache_spec.page_size_bytes,
+            layout="LBHNC",
+        )
+    ]
+
+
+@pytest.mark.parametrize("failure", ["extra_backing", "wrong_size"])
+def test_kv_storage_discrepancies_reject_comparison(kv_storage, failure):
+    config, caches = kv_storage
+    if failure == "extra_backing":
+        caches[1] = caches[1].clone()
+    else:
+        for placement in config.kv_cache_tensors:
+            placement.size += 16
+    with pytest.raises(Unsupported, match="KV backing") as error:
+        kv_storage_inventory(config, caches, "cpu")
+    assert error.value.reason == "kv_storage_mismatch"
+
+
+@pytest.mark.parametrize("failure", ["host", "layout", "blocks", "coverage", "device"])
+def test_unsupported_kv_layouts_are_explicit(kv_storage, failure):
+    config, caches = kv_storage
+    device = "cpu"
+    if failure == "host":
+        config.kv_cache_tensors[0].host_resident = True
+    elif failure == "layout":
+        config.kv_cache_layout = "unknown"
+    elif failure == "blocks":
+        caches[0] = caches[0][1:]
+    elif failure == "coverage":
+        caches.pop()
+    else:
+        device = "cuda:0"
+    with pytest.raises(Unsupported) as error:
+        kv_storage_inventory(config, caches, device)
+    assert error.value.reason == "unsupported_kv_layout"
 
 
 def resolved():
@@ -74,11 +179,12 @@ def test_request_sequence_contains_padded_and_alternating_shapes():
     assert sequence[:6] == [1, 4, 8, 8, 4, 1]
 
 
+@pytest.mark.parametrize("reason", ["cuda_unavailable", "kv_storage_mismatch"])
 def test_unsupported_worker_writes_failure_manifest_and_raw_event(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, reason
 ):
     def reject(*args):
-        raise Unsupported("cuda_unavailable", "injected driver mismatch")
+        raise Unsupported(reason, "injected collector rejection")
 
     monkeypatch.setitem(
         sys.modules, "benchmarks.cudagraphs.production", SimpleNamespace(collect=reject)
@@ -103,7 +209,8 @@ def test_unsupported_worker_writes_failure_manifest_and_raw_event(
     assert run_worker(job) == 2
     manifest = json.loads((directory / "manifest.json").read_text())
     assert manifest["status"] == "unsupported"
-    assert manifest["reason"] == "cuda_unavailable"
+    assert manifest["reason"] == reason
+    assert not (directory / "record.json").exists()
     event = json.loads((directory / "events.jsonl").read_text())
     assert event["status"] == "unsupported" and event["run_id"] == "run"
     with pytest.raises(FileExistsError):

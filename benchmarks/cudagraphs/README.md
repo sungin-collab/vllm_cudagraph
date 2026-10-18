@@ -125,8 +125,16 @@ every standalone descriptor and separate-pool controls. For a smoke run use
 requires an idle CUDA device, NVML and a dense text decoder on the V1 runner;
 distributed execution, MoE, multimodal, hybrid, LoRA and speculative decoding are
 unsupported. Explicit KV bytes avoid the startup graph-memory estimator. KV bytes
-and blocks in records come from the runner's allocated cache configuration;
-independent physical-storage verification remains pending.
+in records count live PyTorch backing storage once, including layout padding but
+excluding allocator reservation slack. The collector checks this count against
+the allocator's single-backing contract: each configured placement describes the
+same allocation, so their sizes must not be summed. It checks device, layer/view
+coverage and scheduler block counts, and saves per-group block/layout details,
+placement metadata and view offsets/strides in `actual_kv` and a
+`kv-storage-verified` event. This check supports device-only full-attention caches;
+host groups, unknown layouts, split kernel-block views, missing views and
+unexplained storage discrepancies reject the run before a successful record is
+published.
 
 Every run retains status/reason, software/source/environment identity, resolved
 and captured descriptors, graph handles/pools, sampled device counters and full

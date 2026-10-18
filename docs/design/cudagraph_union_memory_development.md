@@ -1,6 +1,6 @@
 # CUDA graph union memory: development and team handoff
 
-Updated: 2026-10-18. Implementation checkpoint: `df108058bf`.
+Updated: 2026-10-18. Foundation checkpoint: `df108058bf`; R02 follow-up below.
 
 This document is the working backlog and validation plan for coworkers. The
 [specification](cudagraph_union_memory_spec.md) defines the required behavior and
@@ -12,8 +12,9 @@ Update this backlog and the implementation notes when a task changes status.
 ## Current state
 
 The CPU planner, verifier, lifecycle contracts, diagnostic collector and explicit
-CUDA binding probe are implemented. Real CUDA probe validation and one real-weight
-production baseline smoke run succeeded. **Production union allocation is not
+CUDA binding probe are implemented. R02 now verifies live KV backing storage for
+device-only full-attention caches. Real CUDA probe validation and real-weight
+production baseline smoke runs succeeded. **Production union allocation is not
 implemented, and savings beyond the existing shared CUDA graph pool have not been
 established.** There is no serving opt-in to enable today.
 
@@ -26,7 +27,7 @@ Expanding to V2 or changing the initial runner requires an explicit design updat
 
 | Stage | Current status | Exit condition still missing |
 | --- | --- | --- |
-| 0: baseline | Ownership inventory and one production smoke run done | Independent physical KV verification and a durable, reproducible evidence bundle |
+| 0: baseline | Ownership inventory, baseline smoke and bounded KV backing verification done | A durable, reproducible evidence bundle and human review of R02 |
 | 1: attribution | Collection/reporting tools implemented; measurements incomplete | All-descriptor controls, allocation attribution, noise bounds and frozen opportunity targets |
 | 2: mechanism | Planner and synthetic explicit CUDA binding validated | A production allocation contract and demonstrated recovery beyond existing shared pools |
 | 3: integration | Not started | Positive Stage 1/2 decisions before adding the production adapter and opt-in |
@@ -51,6 +52,7 @@ validation. It does not mean production acceptance.
 | D06 | Fresh-process production diagnostic controls | [collect.py](../../benchmarks/cudagraphs/collect.py), [production.py](../../benchmarks/cudagraphs/production.py) | Shared baseline, maximum-token, standalone and separate-pool tools implemented; only the shared baseline has completed a real-model smoke run |
 | D07 | Explicit CUDA views, transactional graph capture and external outputs | [binding.py](../../benchmarks/cudagraphs/binding.py), [binding_probe.py](../../benchmarks/cudagraphs/binding_probe.py) | Synthetic fill/copy contracts only; 10,000 switches and targeted memcheck passed |
 | D08 | Tests, CI wiring, ownership inventory and reproduction instructions | [planner tests](../../tests/v1/cudagraph/test_cudagraph_memory_planner.py), [binding tests](../../tests/v1/cudagraph/test_cudagraph_memory_binding.py), [collector tests](../../tests/benchmarks/test_cudagraph_memory_collect.py), [report tests](../../tests/benchmarks/test_cudagraph_memory_report.py) | Targeted tests and local hooks passed; remote CI execution is not asserted |
+| D09 / R02 | Live KV backing deduplication and configuration reconciliation | [production.py](../../benchmarks/cudagraphs/production.py), [collector tests](../../tests/benchmarks/test_cudagraph_memory_collect.py) | Padded shared views and fail-closed rejection tested on CPU; Llama CUDA smoke verified 32 views sharing one 256 MiB backing; human review pending |
 
 The CPU foundation is commit `8c008ea589`; collector, binding probe and diagnostic
 reporting are commit `df108058bf`.
@@ -65,7 +67,7 @@ a human reviewer checks code and conclusions.
 | ID / priority | Proposed owner | Work and completion criteria | Dependencies |
 | --- | --- | --- | --- |
 | R01 / next | Measurement owner | Preserve raw evidence in durable team storage; record commit, dirty-source snapshot if any, environment, commands, model revision and artifact checksums. Verify another coworker can reproduce the smoke run. | Existing D06/D07 artifacts |
-| R02 / next | Collector owner | Verify actual KV storage bytes by deduplicating backing storage and recording per-group blocks/layout; reconcile with configured allocations. Reject unsupported layouts or unexplained discrepancies. Add a focused alias/shared-storage regression test. | D06 |
+| R02 / review | Codex implementation; human reviewer pending; local `main` | Implemented in this follow-up: deduplicate live backing, reconcile the single-allocation contract, record per-group blocks/layout and view metadata, and reject unsupported/discrepant storage. See evidence below; reviewer closes this task. | D06; R01 evidence durability still open |
 | R03 / next | Collector owner | Validate every diagnostic variant on the real manager. Audit pre-existing graph ownership, scoped teardown, pool isolation, conflicting engine controls, sampler/cleanup failures and restoration of patched methods. Record failures without publishing successful records. | D06, then R02 for trusted comparisons |
 | R04 / next | Measurement + allocator owners | Run all standalone descriptors and shared/separate-pool controls; attribute persistent, reusable workspace, external and residual bytes without double counting. Obtain access/alias/dependency evidence for candidate storage. Snapshots alone are insufficient. | R01–R03 |
 | R05 / gate | Project owner + reviewer | Freeze absolute MiB opportunity, graph-memory fraction, noise bounds, workloads, output boundaries and final thresholds before tuning. Compute `W_ref` and `E_base` with uncertainty; record continue/stop decision. | R04 |
@@ -126,6 +128,66 @@ that location and hashes. Preserve failed runs as well as successes. Older probe
 and smoke artifacts preceded the final checkpoint; their source/environment
 manifests and recorded dirty-state identity take precedence over this document's
 checkpoint label. Reproduce from a clean commit for formal comparisons.
+
+### R02 implementation and validation handoff
+
+The collector previously summed `KVCacheTensor.size`, although all placements
+describe the same backing allocation in `allocate_kv_cache`. It now counts live
+`untyped_storage()` bytes once per device/base pointer and requires exactly one
+backing of the configured size. It checks device, scheduler block count and
+layer/view coverage; records group blocks/layout, configured placements, storage
+identity, view offsets and byte strides; and rejects host groups, unknown layouts,
+non-full-attention specs, split kernel-block views, missing views and unexplained
+storage discrepancies.
+Layout padding is included; allocator reservation slack is excluded. This checks
+the current CUDA allocator contract, not arbitrary virtual-memory aliases or
+kernel access lifetimes. Serving code and allocation behavior are unchanged.
+
+CPU test design: the collector maps configuration and live views to measurement
+controls or an explicit rejection. The regression guards against counting aliased
+storage repeatedly; real CPU tensors with padded strided views are the cheapest
+effective level. Existing collector tests also cover mismatched backing sizes,
+extra allocations, unsupported views and worker rejection without a success record.
+
+The four-suite command in the coworker runbook passed **110 tests**, with the
+existing CUDA binding test skipped inside the sandbox. All configured pre-commit
+checks on the five changed files passed, including mypy and CI test tethering.
+The CUDA collector check below ran outside the sandbox; the skipped binding test
+was not rerun for this collector-only change. No model evaluation was run.
+
+The real-weight check used the earlier Llama engine options, GPU 0, BF16, Triton
+attention, compilation mode 0 and the same FlashInfer sampler workaround:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 VLLM_USE_FLASHINFER_SAMPLER=0 \
+  .venv/bin/python -m benchmarks.cudagraphs.collect \
+  --engine-config /tmp/union-r02-engine.json --capture-sizes 1,2,4,8 \
+  --kv-cache-memory-bytes 268435456 --variants shared_baseline \
+  --repetitions 1 --stress-steps 100 --output-dir /tmp/union-r02-smoke
+```
+
+Result: successful capture/replay/retirement of four descriptors; 32 live views
+deduplicate to one 268,435,456-byte backing, matching configuration. The cache has
+128 blocks, 16 tokens/block, 65,536 bytes/layer/page and layout `LBNHC`. The saved
+job contains the full engine options, including the pinned cached model revision.
+This is a diagnostic smoke check, not an all-control comparison, model evaluation
+or evidence of graph-memory savings. It ran from checkpoint `324ecfb2c5` with
+source digest `329dc729dedcad6f89742d58ea12366f69e5074d83cefc7229fd927ec487880e`;
+repeat from the clean follow-up commit for formal measurements.
+
+Artifacts are local under
+`/tmp/union-r02-smoke/72599ecd173b4a1b8ce170f161110a9c/`; R01 must preserve them
+alongside the earlier runs. SHA-256 checksums:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `manifest.json` | `b4945b46c2d32d5c917bd04dbe1a7ff14dcb171d2c153525e16bd4228327d0f7` |
+| `record.json` | `60a0b37b9deda4be1477cb50b25f2929ec62725d619828ddf9b59e4102f6f632` |
+| `events.jsonl` | `c01c096532c72660d0eb3bf618fe95c076b62adc70be0dd9625d0ce6d8ff13ab` |
+
+Next coworker actions: review R02, preserve the evidence (R01), and audit/run every
+production control variant (R03). Stage 1 attribution and the R05/R06 decisions
+remain prerequisites for production arena integration.
 
 ## Tests still required
 

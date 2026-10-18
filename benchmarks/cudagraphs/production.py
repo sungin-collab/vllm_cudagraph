@@ -36,6 +36,120 @@ def native_descriptor(mode, descriptor) -> dict:
     return json.loads(json.dumps(asdict(value)))
 
 
+def kv_storage_inventory(config, caches, device) -> dict:
+    """Reconcile live KV views with the single-backing CUDA allocation contract.
+
+    Counts tensor storage bytes, including layout padding, once per backing.
+    Allocator reservation slack and driver allocations are outside this count.
+    """
+    import torch
+
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    placements = config.kv_cache_tensors
+    groups = config.kv_cache_groups
+    if (
+        not placements
+        or not groups
+        or config.num_blocks <= 0
+        or config.kv_cache_layout not in KVCacheLayout.__members__
+        or any(p.host_resident for p in placements)
+        or any(
+            g.host_resident or not isinstance(g.kv_cache_spec, FullAttentionSpec)
+            for g in groups
+        )
+    ):
+        raise Unsupported(
+            "unsupported_kv_layout", "Expected device-only full-attention KV views"
+        )
+    # allocate_kv_cache gives every placement the size of the same backing.
+    sizes = {p.size for p in placements}
+    if len(sizes) != 1 or next(iter(sizes)) <= 0:
+        raise Unsupported(
+            "unsupported_kv_layout", "Expected one configured KV backing size"
+        )
+    configured_bytes = next(iter(sizes))
+    layer_names = [name for group in groups for name in group.layer_names]
+    placed_names = [name for placement in placements for name in placement.layers]
+    if (
+        len(layer_names) != len(set(layer_names))
+        or len(placed_names) != len(set(placed_names))
+        or set(layer_names) != set(placed_names)
+        or len(caches) != len(layer_names)
+    ):
+        raise Unsupported(
+            "unsupported_kv_layout", "KV layer coverage does not match configured views"
+        )
+
+    storages: dict[tuple[str, int], dict] = {}
+    views = []
+    device = torch.device(device)
+    for index, cache in enumerate(caches):
+        if (
+            not isinstance(cache, torch.Tensor)
+            or cache.device != device
+            or cache.layout != torch.strided
+            or cache.numel() == 0
+            or cache.ndim != 4
+            or cache.shape[0] != config.num_blocks
+        ):
+            raise Unsupported(
+                "unsupported_kv_layout",
+                f"KV view {index} must be a strided [B,H,N,C] tensor on {device}",
+            )
+        storage = cache.untyped_storage()
+        key = (str(cache.device), storage.data_ptr())
+        if key not in storages:
+            storages[key] = {
+                "storage_id": len(storages),
+                "device": key[0],
+                "data_ptr": key[1],
+                "bytes": storage.nbytes(),
+            }
+        elif storages[key]["bytes"] != storage.nbytes():
+            raise Unsupported("kv_storage_mismatch", "Inconsistent KV storage extent")
+        views.append(
+            {
+                "runner_index": index,
+                "storage_id": storages[key]["storage_id"],
+                "shape": list(cache.shape),
+                "stride_bytes": [s * cache.element_size() for s in cache.stride()],
+                "offset_bytes": cache.storage_offset() * cache.element_size(),
+                "dtype": str(cache.dtype),
+            }
+        )
+    actual_bytes = sum(s["bytes"] for s in storages.values())
+    if len(storages) != 1 or actual_bytes != configured_bytes:
+        raise Unsupported(
+            "kv_storage_mismatch",
+            f"Expected one {configured_bytes}-byte KV backing; observed "
+            f"{len(storages)} backings totaling {actual_bytes} bytes",
+        )
+    return {
+        "bytes": actual_bytes,
+        "configured_backing_bytes": configured_bytes,
+        "measurement": "deduplicated live untyped storage; excludes allocator slack",
+        "num_blocks": config.num_blocks,
+        "groups": [list(group.layer_names) for group in groups],
+        "layout": config.kv_cache_layout,
+        "group_details": [
+            {
+                "group_id": index,
+                "layers": list(group.layer_names),
+                "num_blocks": config.num_blocks,
+                "block_size_tokens": group.kv_cache_spec.block_size,
+                "page_size_bytes": group.kv_cache_spec.page_size_bytes,
+                "layout": config.kv_cache_layout,
+            }
+            for index, group in enumerate(groups)
+        ],
+        "placements": [asdict(p) for p in placements],
+        "storages": list(storages.values()),
+        "views": views,
+    }
+
+
 class DeviceSampler:
     """NVML samples share the worker clock and never synchronize GPU execution."""
 
@@ -391,17 +505,11 @@ def collect(job: dict, artifacts, manifest: dict) -> RunRecord:
         manifest["captured_descriptors"] = observer.selected
         manifest["graph_executables"] = observer.entries
         config = observer.runner.kv_cache_config
-        actual_kv_bytes = sum(
-            tensor.size
-            for tensor in config.kv_cache_tensors
-            if not tensor.host_resident
+        manifest["actual_kv"] = kv_storage_inventory(
+            config, observer.runner.kv_caches, torch.device("cuda", 0)
         )
-        manifest["actual_kv"] = {
-            "bytes": actual_kv_bytes,
-            "num_blocks": config.num_blocks,
-            "groups": [list(group.layer_names) for group in config.kv_cache_groups],
-            "layout": config.kv_cache_layout,
-        }
+        actual_kv_bytes = manifest["actual_kv"]["bytes"]
+        artifacts.event("kv-storage-verified", **manifest["actual_kv"])
         manifest["startup_graph_estimator"] = "skipped: explicit kv_cache_memory_bytes"
         observer.replay()
         observer.retire()

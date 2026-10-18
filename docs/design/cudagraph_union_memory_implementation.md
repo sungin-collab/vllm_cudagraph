@@ -90,8 +90,14 @@ The collector currently supports one GPU and a dense text decoder using FULL
 uniform decode. It runs diagnostic dummy steps, including padded request shapes,
 and synchronizes at measurement boundaries. These timings are not completed
 serving-step latency, and dummy replay is not a model-accuracy evaluation. Actual
-KV bytes currently come from the runner's allocated KV configuration; independent
-storage-level deduplication remains to be added. Allocator snapshots do not prove
+KV bytes now come from deduplicated live PyTorch backing storage, reconciled with
+the runner's single-backing allocation configuration. Configured placement sizes
+describe the same backing and must not be summed. The collector records per-group
+block/layout details, placement metadata and each view's storage, offset and byte
+strides. It checks scheduler block counts and layer/view coverage, rejecting host
+groups, non-full-attention caches, unknown layouts or storage discrepancies before
+publishing success. This counts layout padding but excludes allocator reservation
+slack; it does not infer kernel access lifetimes. Allocator snapshots do not prove
 kernel accesses or disjoint workspace ownership, so the four memory attribution
 categories remain unknown. The diagnostic reporter preserves that uncertainty
 instead of inferring savings from reserved bytes or reduced graph coverage.
@@ -142,12 +148,22 @@ The [tools README](../../benchmarks/cudagraphs/README.md) provides reproduction
 commands. No GPU memory savings, serving latency improvement or model evaluation
 result is claimed.
 
+The R02 follow-up additionally passed the collector's shared-storage and rejection
+regressions and repeated the real-weight Llama smoke run on GPU 0. Its 32 KV views
+share one **268,435,456-byte** backing, matching the configured 256 MiB, with
+128 blocks and layout `LBNHC`. Four FULL descriptors (1, 2, 4, 8) captured and
+replayed, followed by 100 diagnostic shape switches and successful retirement.
+Evidence is at `/tmp/union-r02-smoke/72599ecd173b4a1b8ce170f161110a9c/`.
+This was a dirty-source diagnostic check, not a formal comparison; the manifest
+records its source identity. See the development handoff for commands and hashes.
+
 ## Remaining gates
 
 1. Complete repeated, all-descriptor production controls with frozen opportunity
-   and noise targets. Validate physical KV storage, attribute allocation ownership
-   and lifetimes, and compute the standalone workspace reference and shared-pool
-   excess with uncertainty. The smoke run alone cannot decide Stage 1.
+   and noise targets. Extend KV-storage verification beyond the supported scope
+   as needed, attribute allocation ownership and lifetimes, and compute the
+   standalone workspace reference and shared-pool excess with uncertainty. The
+   smoke run alone cannot decide Stage 1.
 2. Certify explicit allocation/access contracts for any production candidate and
    demonstrate material recovery beyond the existing shared pool. The synthetic
    binding probe establishes only its own narrow contract.
