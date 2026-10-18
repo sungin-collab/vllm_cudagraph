@@ -2,6 +2,9 @@
 
 Updated: 2026-10-18. CPU foundation commit: `8c008ea589`.
 
+See the [development handoff](cudagraph_union_memory_development.md) for task IDs,
+assignment boundaries, remaining validation and the coworker workflow.
+
 The [specification](cudagraph_union_memory_spec.md) now has CPU prerequisites:
 immutable trace and descriptor contracts, a deterministic planner, an independent
 layout verifier, backend capability assessment, staged family capture/retirement,

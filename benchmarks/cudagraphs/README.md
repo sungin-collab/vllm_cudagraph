@@ -7,6 +7,9 @@ They leave serving defaults unchanged. The probe allocates CUDA storage but does
 not demonstrate savings against the production shared pool. Production union
 binding remains gated on positive Stage 1/2 evidence.
 
+For completed subtasks, the remaining backlog and team validation workflow, see
+the [development handoff](../../docs/design/cudagraph_union_memory_development.md).
+
 ## Simulate a layout
 
 From the repository root, using the repository's `uv` virtual environment:
